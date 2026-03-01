@@ -65,32 +65,37 @@ def _psnr_db(reference_png: bytes, jpeg_bytes: bytes) -> float:
 
 def test_generate_jpeg_savings_report():
     fixtures = _generate_fixture_images()
-    rows: list[dict[str, float | str]] = []
+    profiles = ("jpeg_medium", "jpeg_high", "jpeg_xhigh")
+    rows_by_profile: dict[str, list[dict[str, float | str]]] = {profile: [] for profile in profiles}
 
-    for fixture_name, png_bytes in fixtures.items():
-        png_b64 = base64.b64encode(png_bytes).decode("utf-8")
-        jpeg_b64, _metrics = server.convert_png_base64_to_jpeg_base64(png_b64)
-        jpeg_bytes = base64.b64decode(jpeg_b64)
+    for profile in profiles:
+        settings = server._JPEG_SETTINGS[profile]
+        for fixture_name, png_bytes in fixtures.items():
+            png_b64 = base64.b64encode(png_bytes).decode("utf-8")
+            jpeg_b64, _metrics = server.convert_png_base64_to_jpeg_base64(
+                png_b64,
+                quality=settings["quality"],
+                subsampling=settings["subsampling"],
+            )
+            jpeg_bytes = base64.b64decode(jpeg_b64)
 
-        png_kb = len(png_bytes) / 1024
-        jpeg_kb = len(jpeg_bytes) / 1024
-        saved_kb = png_kb - jpeg_kb
-        saved_percent = ((len(png_bytes) - len(jpeg_bytes)) / len(png_bytes)) * 100
-        psnr = _psnr_db(png_bytes, jpeg_bytes)
+            png_kb = len(png_bytes) / 1024
+            jpeg_kb = len(jpeg_bytes) / 1024
+            saved_kb = png_kb - jpeg_kb
+            saved_percent = ((len(png_bytes) - len(jpeg_bytes)) / len(png_bytes)) * 100
+            psnr = _psnr_db(png_bytes, jpeg_bytes)
 
-        rows.append(
-            {
-                "fixture": fixture_name,
-                "png_kb": png_kb,
-                "jpeg_kb": jpeg_kb,
-                "saved_kb": saved_kb,
-                "saved_percent": saved_percent,
-                "psnr_db": psnr,
-            }
-        )
-
-    avg_saved_percent = sum(float(row["saved_percent"]) for row in rows) / len(rows)
-    avg_psnr = sum(float(row["psnr_db"]) for row in rows) / len(rows)
+            rows_by_profile[profile].append(
+                {
+                    "profile": profile,
+                    "fixture": fixture_name,
+                    "png_kb": png_kb,
+                    "jpeg_kb": jpeg_kb,
+                    "saved_kb": saved_kb,
+                    "saved_percent": saved_percent,
+                    "psnr_db": psnr,
+                }
+            )
 
     report_path = Path(__file__).resolve().parents[1] / "docs" / "reports" / "jpeg-savings.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,25 +103,36 @@ def test_generate_jpeg_savings_report():
     report_lines = [
         "# JPEG Savings Report",
         "",
-        "| Fixture | PNG (KB) | JPEG (KB) | Saved (KB) | Saved (%) | PSNR (dB) |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Profile | Fixture | PNG (KB) | JPEG (KB) | Saved (KB) | Saved (%) | PSNR (dB) |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
 
-    for row in rows:
-        report_lines.append(
-            f"| {row['fixture']} | {float(row['png_kb']):.1f} | {float(row['jpeg_kb']):.1f} | "
-            f"{float(row['saved_kb']):.1f} | {float(row['saved_percent']):.1f} | {float(row['psnr_db']):.2f} |"
-        )
+    for profile in profiles:
+        for row in rows_by_profile[profile]:
+            report_lines.append(
+                f"| {profile} | {row['fixture']} | {float(row['png_kb']):.1f} | {float(row['jpeg_kb']):.1f} | "
+                f"{float(row['saved_kb']):.1f} | {float(row['saved_percent']):.1f} | {float(row['psnr_db']):.2f} |"
+            )
 
-    report_lines.extend(
-        [
-            "",
-            f"Average saved percent: {avg_saved_percent:.1f}",
-            f"Average PSNR (dB): {avg_psnr:.2f}",
-        ]
-    )
+    report_lines.append("")
+    for profile in profiles:
+        avg_saved_percent = (
+            sum(float(row["saved_percent"]) for row in rows_by_profile[profile]) / len(rows_by_profile[profile])
+        )
+        avg_psnr = sum(float(row["psnr_db"]) for row in rows_by_profile[profile]) / len(rows_by_profile[profile])
+        report_lines.append(f"Average saved percent ({profile}): {avg_saved_percent:.1f}")
+        report_lines.append(f"Average PSNR (dB) ({profile}): {avg_psnr:.2f}")
+        report_lines.append("")
+
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
     assert report_path.exists()
-    assert avg_saved_percent >= 20.0
-    assert avg_psnr >= 38.0
+    avg_saved_percent_high = (
+        sum(float(row["saved_percent"]) for row in rows_by_profile["jpeg_high"])
+        / len(rows_by_profile["jpeg_high"])
+    )
+    avg_psnr_high = sum(float(row["psnr_db"]) for row in rows_by_profile["jpeg_high"]) / len(
+        rows_by_profile["jpeg_high"]
+    )
+    assert avg_saved_percent_high >= 20.0
+    assert avg_psnr_high >= 38.0

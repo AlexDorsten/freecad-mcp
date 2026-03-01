@@ -90,7 +90,8 @@ If you want to save token, you can set `only_text_feedback` to `true` and use on
 }
 ```
 
-If you want to reduce screenshot payload size, you can enable JPEG screenshots.
+If you want to reduce screenshot payload size, you can choose a default screenshot format.
+Supported defaults are `png`, `jpeg_medium`, `jpeg_high`, and `jpeg_xhigh`.
 PNG remains the default.
 
 ```json
@@ -100,14 +101,15 @@ PNG remains the default.
       "command": "uvx",
       "args": [
         "freecad-mcp",
-        "--jpeg-screenshots"
+        "--screenshot-format",
+        "jpeg_high"
       ]
     }
   }
 }
 ```
 
-You can combine both flags.
+You can combine screenshot format with text-only mode.
 
 ```json
 {
@@ -117,12 +119,16 @@ You can combine both flags.
       "args": [
         "freecad-mcp",
         "--only-text-feedback",
-        "--jpeg-screenshots"
+        "--screenshot-format",
+        "jpeg_high"
       ]
     }
   }
 }
 ```
+
+All screenshot-returning tools also support an optional `image_format` argument to override the default per call.
+If a JPEG result is hard to read, call the same tool again with `image_format: "png"`.
 
 
 For developer.
@@ -197,6 +203,12 @@ The `--host` value is validated on startup — it must be a valid IPv4/IPv6 addr
 * `get_objects`: Get all objects in a document.
 * `get_object`: Get an object in a document.
 * `get_parts_list`: Get the list of parts in the [parts library](https://github.com/FreeCAD/FreeCAD-library).
+
+Screenshot-returning tools support an optional `image_format` argument:
+- `png`
+- `jpeg_medium`
+- `jpeg_high`
+- `jpeg_xhigh`
 
 ## Contributors
 

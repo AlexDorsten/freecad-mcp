@@ -4,7 +4,7 @@ import base64
 import io
 import xmlrpc.client
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, Literal
+from typing import Any, AsyncIterator, Dict, Literal
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
@@ -16,10 +16,23 @@ logging.basicConfig(
 logger = logging.getLogger("FreeCADMCPserver")
 
 
+ScreenshotFormat = Literal["png", "jpeg_medium", "jpeg_high", "jpeg_xhigh"]
+_SCREENSHOT_FORMAT_CHOICES: tuple[ScreenshotFormat, ...] = (
+    "png",
+    "jpeg_medium",
+    "jpeg_high",
+    "jpeg_xhigh",
+)
+_JPEG_SETTINGS: dict[ScreenshotFormat, dict[str, int]] = {
+    "jpeg_medium": {"quality": 82, "subsampling": 2},
+    "jpeg_high": {"quality": 92, "subsampling": 1},
+    "jpeg_xhigh": {"quality": 97, "subsampling": 0},
+}
+
 _only_text_feedback = False
-_use_jpeg_screenshots = False
+_default_screenshot_format: ScreenshotFormat = "png"
 _rpc_host = "localhost"
-DEFAULT_JPEG_QUALITY = 92
+DEFAULT_JPEG_QUALITY = _JPEG_SETTINGS["jpeg_high"]["quality"]
 
 
 class FreeCADConnection:
@@ -121,7 +134,11 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 
 mcp = FastMCP(
     "FreeCADMCP",
-    instructions="FreeCAD integration through the Model Context Protocol",
+    instructions=(
+        "FreeCAD integration through the Model Context Protocol. "
+        "Screenshot tools support image_format values: png, jpeg_medium, jpeg_high, jpeg_xhigh. "
+        "If a JPEG image is unclear, retry the same tool with image_format='png'."
+    ),
     lifespan=server_lifespan,
 )
 
@@ -144,7 +161,24 @@ def get_freecad_connection():
 
 
 # Helper function to safely add screenshot to response
-def convert_png_base64_to_jpeg_base64(data_b64: str, quality: int = DEFAULT_JPEG_QUALITY) -> tuple[str, dict[str, float]]:
+def _resolve_screenshot_format(image_format: str | None) -> ScreenshotFormat:
+    if image_format is None:
+        return _default_screenshot_format
+    if image_format in _SCREENSHOT_FORMAT_CHOICES:
+        return image_format
+    logger.warning(
+        "Unsupported screenshot image_format '%s'; using default '%s'",
+        image_format,
+        _default_screenshot_format,
+    )
+    return _default_screenshot_format
+
+
+def convert_png_base64_to_jpeg_base64(
+    data_b64: str,
+    quality: int = DEFAULT_JPEG_QUALITY,
+    subsampling: int = _JPEG_SETTINGS["jpeg_high"]["subsampling"],
+) -> tuple[str, dict[str, float]]:
     """Convert a base64 PNG payload to base64 JPEG payload and return size metrics."""
     try:
         from PIL import Image
@@ -158,7 +192,13 @@ def convert_png_base64_to_jpeg_base64(data_b64: str, quality: int = DEFAULT_JPEG
         rgb_image.paste(rgba_image, mask=rgba_image.split()[-1])
 
         output = io.BytesIO()
-        rgb_image.save(output, format="JPEG", quality=quality, optimize=True)
+        rgb_image.save(
+            output,
+            format="JPEG",
+            quality=quality,
+            subsampling=subsampling,
+            optimize=True,
+        )
         jpeg_bytes = output.getvalue()
 
     saved_bytes = len(png_bytes) - len(jpeg_bytes)
@@ -172,29 +212,43 @@ def convert_png_base64_to_jpeg_base64(data_b64: str, quality: int = DEFAULT_JPEG
     return base64.b64encode(jpeg_bytes).decode("utf-8"), metrics
 
 
-def build_screenshot_image_content(screenshot: str) -> ImageContent:
+def build_screenshot_image_content(screenshot: str, image_format: str | None = None) -> ImageContent:
     """Build image content based on configured screenshot format."""
-    if _use_jpeg_screenshots:
-        try:
-            jpeg_screenshot, metrics = convert_png_base64_to_jpeg_base64(screenshot)
-            logger.info(
-                "JPEG screenshot converted: png_kb=%.1f jpeg_kb=%.1f saved_kb=%.1f saved_percent=%.1f",
-                metrics["png_kb"],
-                metrics["jpeg_kb"],
-                metrics["saved_kb"],
-                metrics["saved_percent"],
-            )
-            return ImageContent(type="image", data=jpeg_screenshot, mimeType="image/jpeg")
-        except Exception as exc:
-            logger.warning(f"Failed to convert screenshot to JPEG, falling back to PNG: {exc}")
+    resolved_format = _resolve_screenshot_format(image_format)
+    if resolved_format == "png":
+        return ImageContent(type="image", data=screenshot, mimeType="image/png")
+
+    settings = _JPEG_SETTINGS[resolved_format]
+    try:
+        jpeg_screenshot, metrics = convert_png_base64_to_jpeg_base64(
+            screenshot,
+            quality=settings["quality"],
+            subsampling=settings["subsampling"],
+        )
+        logger.info(
+            "JPEG screenshot converted: format=%s quality=%d png_kb=%.1f jpeg_kb=%.1f saved_kb=%.1f saved_percent=%.1f",
+            resolved_format,
+            settings["quality"],
+            metrics["png_kb"],
+            metrics["jpeg_kb"],
+            metrics["saved_kb"],
+            metrics["saved_percent"],
+        )
+        return ImageContent(type="image", data=jpeg_screenshot, mimeType="image/jpeg")
+    except Exception as exc:
+        logger.warning(
+            "Failed to convert screenshot to format '%s'; falling back to PNG: %s",
+            resolved_format,
+            exc,
+        )
 
     return ImageContent(type="image", data=screenshot, mimeType="image/png")
 
 
-def add_screenshot_if_available(response, screenshot):
+def add_screenshot_if_available(response, screenshot, image_format: str | None = None):
     """Safely add screenshot to response only if it's available"""
     if screenshot is not None and not _only_text_feedback:
-        response.append(build_screenshot_image_content(screenshot))
+        response.append(build_screenshot_image_content(screenshot, image_format=image_format))
     elif not _only_text_feedback:
         # Add an informative message that will be seen by the AI model and user
         response.append(TextContent(
@@ -249,6 +303,7 @@ def create_object(
     obj_name: str,
     analysis_name: str | None = None,
     obj_properties: dict[str, Any] = None,
+    image_format: ScreenshotFormat | None = None,
 ) -> list[TextContent | ImageContent]:
     """Create a new object in FreeCAD.
     Object type is starts with "Part::" or "Draft::" or "PartDesign::" or "Fem::".
@@ -258,6 +313,7 @@ def create_object(
         obj_type: The type of the object to create (e.g. 'Part::Box', 'Part::Cylinder', 'Draft::Circle', 'PartDesign::Body', etc.).
         obj_name: The name of the object to create.
         obj_properties: The properties of the object to create.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A message indicating the success or failure of the object creation and a screenshot of the object.
@@ -375,12 +431,12 @@ def create_object(
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' created successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to create object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to create object: {str(e)}")
         return [
@@ -390,7 +446,7 @@ def create_object(
 
 @mcp.tool()
 def edit_object(
-    ctx: Context, doc_name: str, obj_name: str, obj_properties: dict[str, Any]
+    ctx: Context, doc_name: str, obj_name: str, obj_properties: dict[str, Any], image_format: ScreenshotFormat | None = None
 ) -> list[TextContent | ImageContent]:
     """Edit an object in FreeCAD.
     This tool is used when the `create_object` tool cannot handle the object creation.
@@ -399,6 +455,7 @@ def edit_object(
         doc_name: The name of the document to edit the object in.
         obj_name: The name of the object to edit.
         obj_properties: The properties of the object to edit.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A message indicating the success or failure of the object editing and a screenshot of the object.
@@ -412,12 +469,12 @@ def edit_object(
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' edited successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to edit object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to edit object: {str(e)}")
         return [
@@ -426,12 +483,15 @@ def edit_object(
 
 
 @mcp.tool()
-def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent | ImageContent]:
+def delete_object(
+    ctx: Context, doc_name: str, obj_name: str, image_format: ScreenshotFormat | None = None
+) -> list[TextContent | ImageContent]:
     """Delete an object in FreeCAD.
 
     Args:
         doc_name: The name of the document to delete the object from.
         obj_name: The name of the object to delete.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A message indicating the success or failure of the object deletion and a screenshot of the object.
@@ -445,12 +505,12 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' deleted successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to delete object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to delete object: {str(e)}")
         return [
@@ -459,11 +519,12 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
 
 
 @mcp.tool()
-def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
+def execute_code(ctx: Context, code: str, image_format: ScreenshotFormat | None = None) -> list[TextContent | ImageContent]:
     """Execute arbitrary Python code in FreeCAD.
 
     Args:
         code: The Python code to execute.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A message indicating the success or failure of the code execution, the output of the code execution, and a screenshot of the object.
@@ -477,12 +538,12 @@ def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
             response = [
                 TextContent(type="text", text=f"Code executed successfully: {res['message']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to execute code: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to execute code: {str(e)}")
         return [
@@ -491,7 +552,14 @@ def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
 
 
 @mcp.tool()
-def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Right", "Back", "Left", "Bottom", "Dimetric", "Trimetric"], width: int | None = None, height: int | None = None, focus_object: str | None = None) -> list[ImageContent | TextContent]:
+def get_view(
+    ctx: Context,
+    view_name: Literal["Isometric", "Front", "Top", "Right", "Back", "Left", "Bottom", "Dimetric", "Trimetric"],
+    width: int | None = None,
+    height: int | None = None,
+    focus_object: str | None = None,
+    image_format: ScreenshotFormat | None = None,
+) -> list[ImageContent | TextContent]:
     """Get a screenshot of the active view.
 
     Args:
@@ -509,6 +577,7 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
         width: The width of the screenshot in pixels. If not specified, uses the viewport width.
         height: The height of the screenshot in pixels. If not specified, uses the viewport height.
         focus_object: The name of the object to focus on. If not specified, fits all objects in the view.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A screenshot of the active view.
@@ -517,17 +586,20 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
     screenshot = freecad.get_active_screenshot(view_name, width, height, focus_object)
     
     if screenshot is not None:
-        return [build_screenshot_image_content(screenshot)]
+        return [build_screenshot_image_content(screenshot, image_format=image_format)]
     else:
         return [TextContent(type="text", text="Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)")]
 
 
 @mcp.tool()
-def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextContent | ImageContent]:
+def insert_part_from_library(
+    ctx: Context, relative_path: str, image_format: ScreenshotFormat | None = None
+) -> list[TextContent | ImageContent]:
     """Insert a part from the parts library addon.
 
     Args:
         relative_path: The relative path of the part to insert.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A message indicating the success or failure of the part insertion and a screenshot of the object.
@@ -541,12 +613,12 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
             response = [
                 TextContent(type="text", text=f"Part inserted from library: {res['message']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to insert part from library: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to insert part from library: {str(e)}")
         return [
@@ -555,12 +627,13 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
 
 
 @mcp.tool()
-def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]:
+def get_objects(ctx: Context, doc_name: str, image_format: ScreenshotFormat | None = None) -> list[TextContent | ImageContent]:
     """Get all objects in a document.
     You can use this tool to get the objects in a document to see what you can check or edit.
 
     Args:
         doc_name: The name of the document to get the objects from.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         A list of objects in the document and a screenshot of the document.
@@ -571,7 +644,7 @@ def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]
         response = [
             TextContent(type="text", text=json.dumps(freecad.get_objects(doc_name))),
         ]
-        return add_screenshot_if_available(response, screenshot)
+        return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to get objects: {str(e)}")
         return [
@@ -580,13 +653,16 @@ def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]
 
 
 @mcp.tool()
-def get_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent | ImageContent]:
+def get_object(
+    ctx: Context, doc_name: str, obj_name: str, image_format: ScreenshotFormat | None = None
+) -> list[TextContent | ImageContent]:
     """Get an object from a document.
     You can use this tool to get the properties of an object to see what you can check or edit.
 
     Args:
         doc_name: The name of the document to get the object from.
         obj_name: The name of the object to get.
+        image_format: Optional screenshot format override. One of 'png', 'jpeg_medium', 'jpeg_high', 'jpeg_xhigh'.
 
     Returns:
         The object and a screenshot of the object.
@@ -597,7 +673,7 @@ def get_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent |
         response = [
             TextContent(type="text", text=json.dumps(freecad.get_object(doc_name, obj_name))),
         ]
-        return add_screenshot_if_available(response, screenshot)
+        return add_screenshot_if_available(response, screenshot, image_format=image_format)
     except Exception as e:
         logger.error(f"Failed to get object: {str(e)}")
         return [
@@ -684,17 +760,22 @@ def _validate_host(value: str) -> str:
 
 def main():
     """Run the MCP server"""
-    global _only_text_feedback, _rpc_host, _use_jpeg_screenshots
+    global _only_text_feedback, _rpc_host, _default_screenshot_format
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback")
-    parser.add_argument("--jpeg-screenshots", action="store_true", help="Return screenshot payloads as JPEG instead of PNG")
+    parser.add_argument(
+        "--screenshot-format",
+        choices=_SCREENSHOT_FORMAT_CHOICES,
+        default="png",
+        help="Default format for screenshot payloads",
+    )
     parser.add_argument("--host", type=_validate_host, default="localhost", help="Host address of the FreeCAD RPC server to connect to (default: localhost)")
     args = parser.parse_args()
     _only_text_feedback = args.only_text_feedback
-    _use_jpeg_screenshots = args.jpeg_screenshots
+    _default_screenshot_format = args.screenshot_format
     _rpc_host = args.host
     logger.info(f"Only text feedback: {_only_text_feedback}")
-    logger.info(f"JPEG screenshots: {_use_jpeg_screenshots}")
+    logger.info(f"Default screenshot format: {_default_screenshot_format}")
     logger.info(f"Connecting to FreeCAD RPC server at: {_rpc_host}")
     mcp.run()

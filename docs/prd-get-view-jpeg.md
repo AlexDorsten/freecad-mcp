@@ -32,7 +32,9 @@ Relevante Stellen:
 1. Neuer optionaler CLI-Flag, ähnlich `--only-text-feedback`, für `get_view`-Bildformat.
 2. Unterstützte Formate in v1:
    - `png` (Default)
-   - `jpeg` (optional)
+   - `jpeg_medium`
+   - `jpeg_high`
+   - `jpeg_xhigh`
 3. Bei JPEG-Ausgabe muss für alle Screenshot-Antworten korrekt `mimeType="image/jpeg"` gesetzt werden.
 4. Falls JPEG-Konvertierung fehlschlägt, soll robust auf PNG zurückgefallen werden (mit Warning-Log).
 
@@ -52,13 +54,13 @@ Relevante Stellen:
 
 ### 6.1 Flag-Design (v1)
 - Empfohlen:
-  - `--jpeg-screenshots`
+  - `--screenshot-format {png,jpeg_medium,jpeg_high,jpeg_xhigh}`
 - Verhalten:
   - nicht gesetzt => alle Screenshot-Antworten liefern PNG
-  - gesetzt => alle Screenshot-Antworten liefern JPEG
+  - gesetzt => alle Screenshot-Antworten liefern das gewählte Profil
 
-Alternative:
-- `--screenshot-format {png,jpeg}` (erweiterbarer, aber etwas ausführlicher)
+Zusätzlich:
+- Alle screenshot-liefernden Tools bekommen optional `image_format` als per-Call Override.
 
 ### 6.2 Kompression (v1)
 - Empfehlung: **fester Qualitätswert** statt user-konfigurierbarer Rate.
@@ -87,15 +89,15 @@ Nachteile:
 ## 7.2 Konkrete Codeänderungen
 1. `src/freecad_mcp/server.py`
    - Neue globale Konfiguration:
-     - `_use_jpeg_screenshots: bool = False`
-     - `DEFAULT_JPEG_QUALITY = 92`
+     - `_default_screenshot_format: Literal["png","jpeg_medium","jpeg_high","jpeg_xhigh"] = "png"`
+     - Qualitäts-Map für JPEG-Profile
    - Neues CLI-Argument:
-     - `--jpeg-screenshots` (store_true)
+     - `--screenshot-format` (choices)
    - Helper für Konvertierung:
-     - `convert_png_base64_to_jpeg_base64(data_b64: str, quality: int = 92) -> str`
+     - `convert_png_base64_to_jpeg_base64(data_b64: str, quality: int, subsampling: int)`
    - `add_screenshot_if_available` und `get_view`:
      - bei Flag aus: unverändert PNG
-     - bei Flag an: Konvertierung + `mimeType="image/jpeg"`
+     - bei JPEG-Profil: Konvertierung + `mimeType="image/jpeg"`
      - Fallback auf PNG bei Fehler
 2. `pyproject.toml`
    - Dependency ergänzen: `Pillow` (Runtime), da Konvertierung im MCP-Prozess läuft.
@@ -107,7 +109,7 @@ Nachteile:
    - Bei jeder JPEG-Konvertierung Logeintrag mit:
      - `png_kb`, `jpeg_kb`, `saved_kb`, `saved_percent`
    - Formatbeispiel:
-     - `JPEG screenshot converted: png_kb=512.4 jpeg_kb=141.7 saved_kb=370.7 saved_percent=72.3`
+     - `JPEG screenshot converted: format=jpeg_high quality=92 png_kb=512.4 jpeg_kb=141.7 saved_kb=370.7 saved_percent=72.3`
    - Vorteil:
      - keine API-Änderung, keine zusätzlichen Tokens im Tool-Response.
 
@@ -115,24 +117,26 @@ Nachteile:
 
 ## 8.1 Test-Setup
 - Neue Teststruktur mit `pytest`:
-  - `tests/test_get_view_image_format.py`
+  - `tests/test_screenshot_format.py`
   - `tests/fixtures/` mit 2-3 CAD-ähnlichen Referenzbildern (Linien, Kanten, kleine Beschriftungen, Farbflächen).
 
 ## 8.2 Unit-Tests
 1. Screenshot-Tools ohne Flag:
    - MIME ist `image/png`.
-2. Screenshot-Tools mit JPEG-Flag:
+2. Screenshot-Tools mit JPEG-Profil:
    - MIME ist `image/jpeg`.
    - base64 decodierbar.
-3. Fehlerpfad:
+3. Per-Call Override:
+   - `image_format` überschreibt den globalen Default.
+4. Fehlerpfad:
    - Bei Konvertierungsfehler Fallback zu PNG + Warning-Log.
-4. Keine Regression:
+5. Keine Regression:
    - `--only-text-feedback` Verhalten bleibt unverändert.
 
 Hinweis: Für deterministische Tests wird `get_freecad_connection().get_active_screenshot` gemockt (keine FreeCAD-Laufzeit nötig).
 
 ## 8.3 Qualitäts-/Vergleichstests (automatisiert)
-1. Fixture-PNGs werden via Konvertierungsfunktion zu JPEG verarbeitet.
+1. Fixture-PNGs werden via Konvertierungsfunktion für alle JPEG-Profile verarbeitet.
 2. Metriken:
    - PSNR pro Bild gegen PNG-Referenz.
    - Dateigrößenvergleich PNG vs JPEG.
@@ -142,7 +146,7 @@ Hinweis: Für deterministische Tests wird `get_freecad_connection().get_active_s
 
 ## 8.4 Manueller FreeCAD-Abnahmetest
 1. Identische Szene in FreeCAD öffnen.
-2. `get_view` einmal in PNG, einmal in JPEG erfassen.
+2. `get_view` einmal in PNG und mit mindestens `jpeg_high` erfassen.
 3. Prüfen:
    - Lesbarkeit kleiner Kanten/Skizzenlinien
    - Artefakte an Kontrastkanten
@@ -153,8 +157,8 @@ Hinweis: Für deterministische Tests wird `get_freecad_connection().get_active_s
 1. Testlauf erzeugt einen kleinen Report:
    - `docs/reports/jpeg-savings.md`
 2. Inhalt:
-   - Tabelle pro Fixture (`png_kb`, `jpeg_kb`, `saved_kb`, `saved_percent`, `psnr_db`)
-   - Mittelwerte über alle Fixtures
+   - Tabelle pro Fixture und Profil (`png_kb`, `jpeg_kb`, `saved_kb`, `saved_percent`, `psnr_db`)
+   - Mittelwerte über alle Fixtures pro Profil
 3. Zweck:
    - Nachvollziehbare, versionierbare Evidenz der Ersparnis und Qualitätsnähe für PRs.
 
