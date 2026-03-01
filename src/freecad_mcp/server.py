@@ -1,5 +1,7 @@
 import json
 import logging
+import base64
+import io
 import xmlrpc.client
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Literal
@@ -15,7 +17,9 @@ logger = logging.getLogger("FreeCADMCPserver")
 
 
 _only_text_feedback = False
+_use_jpeg_screenshots = False
 _rpc_host = "localhost"
+DEFAULT_JPEG_QUALITY = 92
 
 
 class FreeCADConnection:
@@ -140,10 +144,57 @@ def get_freecad_connection():
 
 
 # Helper function to safely add screenshot to response
+def convert_png_base64_to_jpeg_base64(data_b64: str, quality: int = DEFAULT_JPEG_QUALITY) -> tuple[str, dict[str, float]]:
+    """Convert a base64 PNG payload to base64 JPEG payload and return size metrics."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for JPEG screenshot conversion") from exc
+
+    png_bytes = base64.b64decode(data_b64)
+    with Image.open(io.BytesIO(png_bytes)) as image:
+        rgba_image = image.convert("RGBA")
+        rgb_image = Image.new("RGB", rgba_image.size, (255, 255, 255))
+        rgb_image.paste(rgba_image, mask=rgba_image.split()[-1])
+
+        output = io.BytesIO()
+        rgb_image.save(output, format="JPEG", quality=quality, optimize=True)
+        jpeg_bytes = output.getvalue()
+
+    saved_bytes = len(png_bytes) - len(jpeg_bytes)
+    saved_percent = (saved_bytes / len(png_bytes)) * 100 if png_bytes else 0.0
+    metrics = {
+        "png_kb": len(png_bytes) / 1024,
+        "jpeg_kb": len(jpeg_bytes) / 1024,
+        "saved_kb": saved_bytes / 1024,
+        "saved_percent": saved_percent,
+    }
+    return base64.b64encode(jpeg_bytes).decode("utf-8"), metrics
+
+
+def build_screenshot_image_content(screenshot: str) -> ImageContent:
+    """Build image content based on configured screenshot format."""
+    if _use_jpeg_screenshots:
+        try:
+            jpeg_screenshot, metrics = convert_png_base64_to_jpeg_base64(screenshot)
+            logger.info(
+                "JPEG screenshot converted: png_kb=%.1f jpeg_kb=%.1f saved_kb=%.1f saved_percent=%.1f",
+                metrics["png_kb"],
+                metrics["jpeg_kb"],
+                metrics["saved_kb"],
+                metrics["saved_percent"],
+            )
+            return ImageContent(type="image", data=jpeg_screenshot, mimeType="image/jpeg")
+        except Exception as exc:
+            logger.warning(f"Failed to convert screenshot to JPEG, falling back to PNG: {exc}")
+
+    return ImageContent(type="image", data=screenshot, mimeType="image/png")
+
+
 def add_screenshot_if_available(response, screenshot):
     """Safely add screenshot to response only if it's available"""
     if screenshot is not None and not _only_text_feedback:
-        response.append(ImageContent(type="image", data=screenshot, mimeType="image/png"))
+        response.append(build_screenshot_image_content(screenshot))
     elif not _only_text_feedback:
         # Add an informative message that will be seen by the AI model and user
         response.append(TextContent(
@@ -466,7 +517,7 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
     screenshot = freecad.get_active_screenshot(view_name, width, height, focus_object)
     
     if screenshot is not None:
-        return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
+        return [build_screenshot_image_content(screenshot)]
     else:
         return [TextContent(type="text", text="Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)")]
 
@@ -633,14 +684,17 @@ def _validate_host(value: str) -> str:
 
 def main():
     """Run the MCP server"""
-    global _only_text_feedback, _rpc_host
+    global _only_text_feedback, _rpc_host, _use_jpeg_screenshots
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback")
+    parser.add_argument("--jpeg-screenshots", action="store_true", help="Return screenshot payloads as JPEG instead of PNG")
     parser.add_argument("--host", type=_validate_host, default="localhost", help="Host address of the FreeCAD RPC server to connect to (default: localhost)")
     args = parser.parse_args()
     _only_text_feedback = args.only_text_feedback
+    _use_jpeg_screenshots = args.jpeg_screenshots
     _rpc_host = args.host
     logger.info(f"Only text feedback: {_only_text_feedback}")
+    logger.info(f"JPEG screenshots: {_use_jpeg_screenshots}")
     logger.info(f"Connecting to FreeCAD RPC server at: {_rpc_host}")
     mcp.run()

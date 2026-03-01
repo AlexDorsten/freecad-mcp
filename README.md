@@ -90,6 +90,40 @@ If you want to save token, you can set `only_text_feedback` to `true` and use on
 }
 ```
 
+If you want to reduce screenshot payload size, you can enable JPEG screenshots.
+PNG remains the default.
+
+```json
+{
+  "mcpServers": {
+    "freecad": {
+      "command": "uvx",
+      "args": [
+        "freecad-mcp",
+        "--jpeg-screenshots"
+      ]
+    }
+  }
+}
+```
+
+You can combine both flags.
+
+```json
+{
+  "mcpServers": {
+    "freecad": {
+      "command": "uvx",
+      "args": [
+        "freecad-mcp",
+        "--only-text-feedback",
+        "--jpeg-screenshots"
+      ]
+    }
+  }
+}
+```
+
 
 For developer.
 First, you need clone this repository.
